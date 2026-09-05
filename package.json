@@ -1,0 +1,12 @@
+{
+  "name": "watermark",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Electron desktop AI video inpainting / watermark region repair",
+  "scripts": {
+    "dev": "npm --prefix electron run dev",
+    "build": "npm --prefix electron run build:win",
+    "setup:backend": "python -m pip install -r backend/requirements.txt",
+    "setup:propainter": "python backend/setup_propainter.py"
+  }
+}

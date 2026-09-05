@@ -1,0 +1,46 @@
+appId: com.watermark.app
+productName: WaterMark
+directories:
+  buildResources: build
+  output: release
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+asarUnpack:
+  - resources/**
+extraResources:
+  - from: ../backend
+    to: backend
+    filter:
+      - '**/*'
+      - '!**/.venv/**'
+      - '!**/venv/**'
+      - '!**/vendor/**'
+      - '!**/.jobs/**'
+      - '!**/__pycache__/**'
+      - '!**/*.pyc'
+      - '!**/models/**'
+win:
+  executableName: WaterMark
+nsis:
+  artifactName: ${name}-${version}-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  createDesktopShortcut: always
+mac:
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: false
+dmg:
+  artifactName: ${name}-${version}.${ext}
+linux:
+  target:
+    - AppImage
+  maintainer: watermark.local
+  category: Video
+appImage:
+  artifactName: ${name}-${version}.${ext}
+npmRebuild: false

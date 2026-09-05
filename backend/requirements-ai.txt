@@ -1,0 +1,16 @@
+# Install CUDA PyTorch first, then this file.
+# Example (CUDA 12.4):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+# Then:
+#   pip install -r requirements-ai.txt
+av
+addict
+einops
+future
+scipy
+matplotlib
+scikit-image
+timm
+tqdm
+requests

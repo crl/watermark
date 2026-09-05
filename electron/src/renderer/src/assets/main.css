@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Segoe UI", "PingFang SC", "Microsoft YaHei UI", sans-serif;
+  --color-ink: #09090b;
+  --color-panel: #121216;
+  --color-raised: #1a1a20;
+  --color-line: #2a2a32;
+  --color-gold: #e4b56a;
+  --color-gold-2: #f0d09a;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--color-ink);
+  color: #f4f1ea;
+  font-family: var(--font-sans);
+  user-select: none;
+  overflow: hidden;
+}
+
+button,
+a,
+input,
+select {
+  font-family: inherit;
+}
+
+video::-webkit-media-controls-enclosure {
+  display: none !important;
+}
+
+.wm-mark:hover {
+  background: #fde68a;
+}
