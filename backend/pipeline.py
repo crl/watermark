@@ -13,10 +13,11 @@ from propainter_runner import cuda_status, run_propainter
 from setup_propainter import propainter_ready
 from tracker import (
     JobCancelled,
+    PauseController,
+    checkpoint,
     encode_frames,
     extract_frames,
     inpaint_frames,
-    throw_if_cancelled,
     track_region,
     write_union_masks,
 )
@@ -152,12 +153,13 @@ def _track_all(
     info: dict,
     on_progress,
     cancel_event: Event | None,
+    pause: PauseController | None = None,
 ) -> list:
     fps = info["fps"]
     n = len(frames)
     tracked = []
     for index, region in enumerate(regions, start=1):
-        throw_if_cancelled(cancel_event)
+        checkpoint(cancel_event, pause, on_progress)
         seed = clamp_oriented(region, info["width"], info["height"])
         time_sec = float(region.get("timeSec") or 0)
         start_index = int(round(time_sec * fps))
@@ -174,6 +176,8 @@ def _track_all(
                     f"匹配第 {i}/{count} 块 {idx + 1}/{total}",
                 ),
                 cancel_event=cancel_event,
+                pause=pause,
+                on_status=on_progress,
             )
         )
     return tracked
@@ -190,8 +194,10 @@ def run_job(
     track: bool,
     on_progress,
     cancel_event: Event | None = None,
+    pause: PauseController | None = None,
 ) -> tuple[str, str, bool]:
     work_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint(cancel_event, pause, on_progress)
     on_progress("probe", 0.04, "读取视频信息")
     info = probe_video(input_path)
     items = _normalize_regions(regions, rect)
@@ -200,16 +206,22 @@ def run_job(
     seeds = [clamp_oriented(item, info["width"], info["height"]) for item in items]
 
     on_progress("extract", 0.06, "抽出视频帧")
-    frames = extract_frames(input_path, work_dir / "frames", cancel_event=cancel_event)
+    frames = extract_frames(
+        input_path, work_dir / "frames", cancel_event=cancel_event, pause=pause, on_status=on_progress
+    )
     if track:
-        region_boxes = _track_all(frames, items, info, on_progress, cancel_event)
+        region_boxes = _track_all(frames, items, info, on_progress, cancel_event, pause=pause)
     else:
         region_boxes = [[[seed] for _ in frames] for seed in seeds]
 
+    checkpoint(cancel_event, pause, on_progress)
     on_progress("mask", 0.30, "生成逐帧遮罩")
-    mask_dir = write_union_masks(frames, region_boxes, work_dir / "masks", cancel_event=cancel_event)
+    mask_dir = write_union_masks(
+        frames, region_boxes, work_dir / "masks", cancel_event=cancel_event, pause=pause, on_status=on_progress
+    )
 
     if used_engine == "delogo":
+        checkpoint(cancel_event, pause, on_progress)
         on_progress("inpaint", 0.35, "逐帧修补")
         repaired = inpaint_frames(
             frames,
@@ -221,22 +233,26 @@ def run_job(
                 f"逐帧修补 {i + 1}/{total}",
             ),
             cancel_event=cancel_event,
+            pause=pause,
+            on_status=on_progress,
         )
         partial = bool(cancel_event and cancel_event.is_set())
         if not repaired:
             raise JobCancelled(None, used_engine)
+        checkpoint(cancel_event, pause, on_progress)
         visual = str(work_dir / "visual.mp4")
         encode_frames(repaired, info["fps"], visual)
         return _finish_visual(visual, input_path, output_path, info["fps"], on_progress, partial, used_engine)
 
     ratio = compute_resize_ratio(info["width"], info["height"], max_edge)
+    checkpoint(cancel_event, pause, on_progress)
     on_progress("inpaint", 0.34, "ProPainter 修复中")
     pp_out_dir = str(work_dir / "propainter")
     Path(pp_out_dir).mkdir(parents=True, exist_ok=True)
     last_error = None
     visual = None
     for attempt_ratio in (ratio, min(ratio, 0.5), min(ratio, 0.35)):
-        throw_if_cancelled(cancel_event)
+        checkpoint(cancel_event, pause, on_progress)
         try:
 
             def log_line(line: str):
@@ -256,6 +272,8 @@ def run_job(
                 subvideo_length=80 if attempt_ratio >= 0.7 else 40,
                 on_log=log_line,
                 cancel_event=cancel_event,
+                pause=pause,
+                on_status=on_progress,
             )
             last_error = None
             break
@@ -273,4 +291,5 @@ def run_job(
     if visual is None:
         raise RuntimeError("ProPainter 未产出结果")
 
+    checkpoint(cancel_event, pause, on_progress)
     return _finish_visual(str(visual), input_path, output_path, info["fps"], on_progress, False, used_engine)

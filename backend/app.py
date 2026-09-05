@@ -19,7 +19,7 @@ from ffmpeg_util import find_ffmpeg
 from pipeline import probe_video, run_job
 from propainter_runner import cuda_status
 from setup_propainter import ensure_propainter, propainter_ready
-from tracker import JobCancelled
+from tracker import JobCancelled, PauseController
 
 ROOT = Path(__file__).resolve().parent
 JOBS_DIR = ROOT / ".jobs"
@@ -92,6 +92,7 @@ async def create_job(body: CreateJob):
     work_dir.mkdir(parents=True, exist_ok=True)
     queue: asyncio.Queue = asyncio.Queue()
     cancel_event = threading.Event()
+    pause = PauseController()
     job = {
         "id": job_id,
         "status": "running",
@@ -101,6 +102,7 @@ async def create_job(body: CreateJob):
         "error": None,
         "cancel": False,
         "cancel_event": cancel_event,
+        "pause": pause,
     }
     jobs[job_id] = job
 
@@ -125,6 +127,7 @@ async def create_job(body: CreateJob):
                 track=body.track,
                 on_progress=progress,
                 cancel_event=cancel_event,
+                pause=pause,
             )
             job["status"] = "done"
             job["outputPath"] = output
@@ -154,9 +157,8 @@ async def create_job(body: CreateJob):
                     }
                 )
             else:
-                job["status"] = "error"
-                job["error"] = "还没有可预览的画面"
-                await queue.put({"stage": "error", "message": "还没有可预览的画面，请稍后再停止"})
+                job["status"] = "cancelled"
+                await queue.put({"stage": "cancelled", "progress": 0, "message": "已取消，尚未开始修复"})
         except Exception as exc:
             job["status"] = "error"
             job["error"] = str(exc)
@@ -168,6 +170,32 @@ async def create_job(body: CreateJob):
     return {"jobId": job_id}
 
 
+@app.post("/jobs/{job_id}/pause")
+def pause_job(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    controller = job.get("pause")
+    if controller is None:
+        raise HTTPException(400, "任务不支持暂停")
+    job["status"] = "pausing"
+    controller.pause()
+    return {"ok": True}
+
+
+@app.post("/jobs/{job_id}/resume")
+def resume_job(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    controller = job.get("pause")
+    if controller is None:
+        raise HTTPException(400, "任务不支持继续")
+    job["status"] = "running"
+    controller.resume()
+    return {"ok": True}
+
+
 @app.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
     job = jobs.get(job_id)
@@ -177,6 +205,9 @@ def cancel_job(job_id: str):
     event = job.get("cancel_event")
     if event is not None:
         event.set()
+    controller = job.get("pause")
+    if controller is not None:
+        controller.resume()
     return {"ok": True}
 
 

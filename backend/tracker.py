@@ -23,17 +23,59 @@ class JobCancelled(Exception):
         self.engine = engine
 
 
+class PauseController:
+    def __init__(self) -> None:
+        self._can_run = Event()
+        self._can_run.set()
+
+    def pause(self) -> None:
+        self._can_run.clear()
+
+    def resume(self) -> None:
+        self._can_run.set()
+
+    def is_paused(self) -> bool:
+        return not self._can_run.is_set()
+
+    def wait_if_paused(self, cancel_event: Event | None = None, on_progress=None) -> None:
+        throw_if_cancelled(cancel_event)
+        if self._can_run.is_set():
+            return
+        if on_progress:
+            on_progress("paused", None, "已暂停，可点继续")
+        while not self._can_run.is_set():
+            throw_if_cancelled(cancel_event)
+            self._can_run.wait(timeout=0.25)
+        throw_if_cancelled(cancel_event)
+
+
 def throw_if_cancelled(cancel_event: Event | None) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise JobCancelled()
 
 
-def extract_frames(video_path: str, out_dir: Path, cancel_event: Event | None = None) -> list[Path]:
+def checkpoint(
+    cancel_event: Event | None = None,
+    pause: PauseController | None = None,
+    on_progress=None,
+) -> None:
     throw_if_cancelled(cancel_event)
+    if pause is not None:
+        pause.wait_if_paused(cancel_event=cancel_event, on_progress=on_progress)
+
+
+def extract_frames(
+    video_path: str,
+    out_dir: Path,
+    cancel_event: Event | None = None,
+    pause: PauseController | None = None,
+    on_status=None,
+) -> list[Path]:
+    checkpoint(cancel_event, pause, on_status)
     out_dir.mkdir(parents=True, exist_ok=True)
     pattern = str(out_dir / "%06d.jpg")
     result = run_ffmpeg(["-y", "-i", video_path, "-q:v", "2", pattern])
-    throw_if_cancelled(cancel_event)
+    checkpoint(cancel_event, pause, on_status)
     files = sorted(out_dir.glob("*.jpg"))
     if files:
         return files
@@ -42,7 +84,7 @@ def extract_frames(video_path: str, out_dir: Path, cancel_event: Event | None = 
         raise RuntimeError(f"抽帧失败\n{(result.stderr or '')[-1200:]}")
     index = 1
     while True:
-        throw_if_cancelled(cancel_event)
+        checkpoint(cancel_event, pause, on_status)
         ok, frame = cap.read()
         if not ok:
             break
@@ -147,6 +189,8 @@ def track_region(
     seed: Oriented,
     on_progress=None,
     cancel_event: Event | None = None,
+    pause: PauseController | None = None,
+    on_status=None,
 ) -> list[list[Oriented]]:
     n = len(frames)
     boxes: list[list[Oriented]] = [[] for _ in range(n)]
@@ -164,7 +208,7 @@ def track_region(
     boxes[start_index] = [seed]
 
     for idx, frame_path in enumerate(frames):
-        throw_if_cancelled(cancel_event)
+        checkpoint(cancel_event, pause, on_status)
         if idx == start_index:
             continue
         bgr = cv2.imread(str(frame_path))
@@ -188,6 +232,8 @@ def write_union_masks(
     mask_dir: Path,
     pad: int = MASK_PAD,
     cancel_event: Event | None = None,
+    pause: PauseController | None = None,
+    on_status=None,
 ) -> Path:
     mask_dir.mkdir(parents=True, exist_ok=True)
     sample = cv2.imread(str(frames[0]))
@@ -197,7 +243,7 @@ def write_union_masks(
     k = max(1, pad * 2 + 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     for i, frame_path in enumerate(frames):
-        throw_if_cancelled(cancel_event)
+        checkpoint(cancel_event, pause, on_status)
         mask = np.zeros((height, width), dtype=np.uint8)
         for per_region in region_boxes:
             frame_boxes = per_region[i] if i < len(per_region) else []
@@ -217,10 +263,14 @@ def inpaint_frames(
     out_dir: Path,
     on_progress=None,
     cancel_event: Event | None = None,
+    pause: PauseController | None = None,
+    on_status=None,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for i, frame_path in enumerate(frames):
+        if pause is not None:
+            pause.wait_if_paused(cancel_event=None, on_progress=on_status)
         if cancel_event is not None and cancel_event.is_set():
             break
         image = cv2.imread(str(frame_path))

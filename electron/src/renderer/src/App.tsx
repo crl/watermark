@@ -61,7 +61,10 @@ export default function App(): JSX.Element {
   const [partial, setPartial] = useState(false)
   const [seekTo, setSeekTo] = useState<{ time: number; nonce: number } | null>(null)
   const [activeJobId, setActiveJobId] = useState<string | null>(null)
+  const [paused, setPaused] = useState(false)
+  const [jobStage, setJobStage] = useState('')
   const jobIdRef = useRef<string | null>(null)
+  const pauseWantedRef = useRef(false)
 
   const apiBase = sidecar.port ? `http://127.0.0.1:${sidecar.port}` : null
 
@@ -173,6 +176,9 @@ export default function App(): JSX.Element {
       return
     }
     setBusy(true)
+    setPaused(false)
+    pauseWantedRef.current = false
+    setJobStage('')
     setError(null)
     setCompare(false)
     setPartial(false)
@@ -209,13 +215,26 @@ export default function App(): JSX.Element {
           const payload = JSON.parse(event.data) as JobEvent
           if (typeof payload.progress === 'number') setProgress(payload.progress)
           if (payload.message) setMessage(payload.message)
+          if (payload.stage === 'paused') {
+            if (pauseWantedRef.current) setPaused(true)
+            return
+          }
+          if (payload.stage) setJobStage(payload.stage)
+          if (!pauseWantedRef.current) setPaused(false)
           if (payload.stage === 'done' && payload.outputPath) {
             setResultPath(payload.outputPath)
             setUsedEngine(payload.engine ?? engine)
             setPartial(Boolean(payload.partial))
+            setPaused(false)
+            finish(() => resolve())
+          }
+          if (payload.stage === 'cancelled') {
+            setProgress(0)
+            setPaused(false)
             finish(() => resolve())
           }
           if (payload.stage === 'error') {
+            setPaused(false)
             finish(() => reject(new Error(payload.message || '处理失败')))
           }
         }
@@ -230,13 +249,24 @@ export default function App(): JSX.Element {
       jobIdRef.current = null
       setActiveJobId(null)
       setBusy(false)
+      setPaused(false)
     }
   }, [apiBase, engine, inputPath, maxEdge, pixelRegions, regions.length])
 
-  const stopJob = useCallback(async () => {
+  const pauseJob = useCallback(async () => {
     if (!apiBase || !jobIdRef.current) return
-    setMessage('正在停止并生成已处理片段…')
-    await fetch(`${apiBase}/jobs/${jobIdRef.current}/cancel`, { method: 'POST' })
+    pauseWantedRef.current = true
+    setPaused(true)
+    setMessage(jobStage === 'inpaint' || jobStage === 'mux' ? '正在暂停（当前段结束后生效）…' : '正在暂停…')
+    await fetch(`${apiBase}/jobs/${jobIdRef.current}/pause`, { method: 'POST' })
+  }, [apiBase, jobStage])
+
+  const resumeJob = useCallback(async () => {
+    if (!apiBase || !jobIdRef.current) return
+    pauseWantedRef.current = false
+    setPaused(false)
+    setMessage('继续处理…')
+    await fetch(`${apiBase}/jobs/${jobIdRef.current}/resume`, { method: 'POST' })
   }, [apiBase])
 
   useEffect(() => {
@@ -311,6 +341,13 @@ export default function App(): JSX.Element {
               src={mediaUrl}
               regions={regions}
               seekTo={seekTo}
+              jobProgress={progress}
+              jobMessage={message}
+              jobStage={jobStage}
+              busy={busy}
+              paused={paused}
+              jobDone={Boolean(resultPath) && !partial}
+              jobPartial={partial}
               onAddRegion={addRegion}
               onUpdateRegion={updateRegion}
               onDeleteRegion={deleteRegion}
@@ -440,12 +477,12 @@ export default function App(): JSX.Element {
 
           <button
             className={`mt-auto rounded-xl px-3 py-3 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 ${
-              busy ? 'bg-zinc-100 text-zinc-950' : 'bg-amber-300 text-zinc-950'
+              busy && !paused ? 'bg-zinc-100 text-zinc-950' : 'bg-amber-300 text-zinc-950'
             }`}
             disabled={busy ? !activeJobId : !canStart}
-            onClick={() => void (busy ? stopJob() : startJob())}
+            onClick={() => void (busy ? (paused ? resumeJob() : pauseJob()) : startJob())}
           >
-            {busy ? '停止' : '开始修复'}
+            {busy ? (paused ? '继续' : '暂停') : '开始修复'}
           </button>
 
           {resultPath ? (
@@ -483,15 +520,11 @@ export default function App(): JSX.Element {
       </main>
 
       <footer className="border-t border-white/8 px-6 py-3">
-        <div className="mb-2 flex items-center justify-between text-xs text-zinc-400">
+        <div className="flex items-center justify-between text-xs text-zinc-400">
           <span>{message}</span>
           <span>
-            {usedEngine ? `引擎：${usedEngine}` : ''} {partial ? '部分 ' : ''}
-            {Math.round(progress * 100)}%
+            {usedEngine ? `引擎：${usedEngine}` : ''} {partial ? '部分' : ''}
           </span>
-        </div>
-        <div className="h-1.5 overflow-hidden rounded-full bg-white/8">
-          <div className="h-full bg-amber-300 transition-all" style={{ width: `${Math.round(progress * 100)}%` }} />
         </div>
         {error || sidecar.error ? (
           <pre className="mt-2 max-h-24 overflow-auto whitespace-pre-wrap text-[11px] text-red-300">

@@ -13,6 +13,13 @@ type Props = {
   src: string | null
   regions: Region[]
   seekTo: { time: number; nonce: number } | null
+  jobProgress?: number
+  jobMessage?: string
+  jobStage?: string
+  busy?: boolean
+  paused?: boolean
+  jobDone?: boolean
+  jobPartial?: boolean
   onAddRegion: (rect: Rect, timeSec: number) => void
   onUpdateRegion: (id: string, rect: Rect) => void
   onDeleteRegion: (id: string) => void
@@ -138,6 +145,13 @@ export function VideoCanvas({
   src,
   regions,
   seekTo,
+  jobProgress = 0,
+  jobMessage = '',
+  jobStage = '',
+  busy = false,
+  paused = false,
+  jobDone = false,
+  jobPartial = false,
   onAddRegion,
   onUpdateRegion,
   onDeleteRegion
@@ -457,6 +471,17 @@ export function VideoCanvas({
   }
 
   const progress = duration > 0 ? displayTime / duration : 0
+  const jobFill = busy ? clamp(jobProgress, 0, 1) : jobDone || jobPartial ? 1 : 0
+  const preparing = !jobStage || ['probe', 'extract', 'track', 'mask'].includes(jobStage)
+  const jobLabel = busy
+    ? paused
+      ? `已暂停  ${Math.round(jobFill * 100)}%`
+      : `${preparing ? '准备中' : '修复中'} · ${jobMessage || '处理中'}  ${Math.round(jobFill * 100)}%`
+    : jobPartial
+      ? '部分完成'
+      : jobDone
+        ? '修复完成'
+        : '未开始处理'
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden rounded-2xl bg-black">
@@ -639,6 +664,19 @@ export function VideoCanvas({
                 ))}
               </div>
             ) : null}
+            <div className="pointer-events-none relative mt-1 h-5 overflow-hidden rounded-full bg-white/10">
+              <div
+                className="absolute inset-y-0 left-0 bg-amber-300/85 transition-all"
+                style={{ width: `${Math.round(jobFill * 100)}%` }}
+              />
+              <div
+                className={`relative z-10 truncate px-2 text-center text-[10px] leading-5 ${
+                  jobFill > 0.35 ? 'text-zinc-950' : 'text-zinc-400'
+                }`}
+              >
+                {jobLabel}
+              </div>
+            </div>
           </div>
           <span className="w-[4.8rem] shrink-0 font-mono text-[11px] tabular-nums text-zinc-500">
             {formatTime(duration)}
