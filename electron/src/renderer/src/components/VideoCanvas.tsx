@@ -620,15 +620,6 @@ export function VideoCanvas({
               <div className="pointer-events-none absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-white/12">
                 <div className="h-full rounded-full bg-amber-300" style={{ width: `${Math.min(100, progress * 100)}%` }} />
               </div>
-              {duration > 0
-                ? marks.map((time) => (
-                    <div
-                      key={`tick-${time}`}
-                      className="pointer-events-none absolute top-1/2 z-0 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-300"
-                      style={{ left: `${(time / duration) * 100}%` }}
-                    />
-                  ))
-                : null}
               <div
                 ref={seekBarRef}
                 role="slider"

@@ -1,21 +1,16 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 from threading import Event
 
 import cv2
 
-from setup_propainter import PROPAINTER_DIR, propainter_ready
-from tracker import JobCancelled, PauseController, checkpoint, encode_frames
+from setup_propainter import propainter_ready
+from tracker import JobCancelled, PauseController, encode_frames
+from propainter_session import ensure_models, inpaint_folder
 
-OOM_HINT = (
-    "显存不足。请把「处理分辨率」调低后再试，或关闭其他占用 GPU 的程序。"
-)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
@@ -63,75 +58,21 @@ def _run_once(
     on_log,
     cancel_event: Event | None,
 ) -> Path:
-    cmd = [
-        sys.executable,
-        "inference_propainter.py",
-        "--video",
+    ensure_models(on_log)
+    save_root = inpaint_folder(
         video_path,
-        "--mask",
         mask_path,
-        "--output",
         output_dir,
-        "--resize_ratio",
-        str(resize_ratio),
-        "--save_fps",
-        str(max(1, save_fps)),
-        "--subvideo_length",
-        str(subvideo_length),
-        "--save_frames",
-    ]
-    if fp16:
-        cmd.append("--fp16")
-
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(PROPAINTER_DIR),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
+        resize_ratio=resize_ratio,
+        fp16=fp16,
+        save_fps=save_fps,
+        subvideo_length=subvideo_length,
+        on_log=on_log,
+        cancel_event=cancel_event,
     )
-    assert proc.stdout is not None
-    combined: list[str] = []
-    progress_re = re.compile(r"(\d+)%\|")
-    try:
-        for line in proc.stdout:
-            if cancel_event is not None and cancel_event.is_set():
-                proc.kill()
-                break
-            combined.append(line)
-            stripped = line.strip()
-            if stripped:
-                on_log(stripped)
-            match = progress_re.search(line)
-            if match:
-                on_log(f"PROPAINTER_PCT {match.group(1)}")
-    finally:
-        proc.wait()
-
-    if cancel_event is not None and cancel_event.is_set():
-        out = Path(output_dir)
-        candidates = list(out.rglob("inpaint_out.mp4"))
-        if candidates:
-            return candidates[0]
-        raise JobCancelled(None, "propainter")
-
-    text = "".join(combined)
-    if proc.returncode != 0:
-        lower = text.lower()
-        if "out of memory" in lower or "cuda out of memory" in lower or "memoryerror" in lower:
-            raise RuntimeError(OOM_HINT)
-        raise RuntimeError(f"ProPainter 失败（退出码 {proc.returncode}）\n{text[-2000:]}")
-
-    out = Path(output_dir)
-    candidates = list(out.rglob("inpaint_out.mp4"))
-    if not candidates:
-        raise RuntimeError("ProPainter 未生成 inpaint_out.mp4")
-    return candidates[0]
+    if _collect_chunk_frames(Path(output_dir)):
+        return save_root
+    raise RuntimeError("ProPainter 未产出修复帧")
 
 
 def _chunk_ranges(count: int, size: int, overlap: int) -> list[tuple[int, int]]:
@@ -222,10 +163,10 @@ def _run_chunked(
         shutil.rmtree(chunk_root, ignore_errors=True)
 
     stitched_files = _list_images(stitched)
+    if cancel_event is not None and cancel_event.is_set():
+        raise JobCancelled(None, "propainter")
     if not stitched_files:
-        raise JobCancelled(None, "propainter") if cancel_event is not None and cancel_event.is_set() else RuntimeError(
-            "分段修复后没有可用画面"
-        )
+        raise RuntimeError("分段修复后没有可用画面")
     visual = output_dir / "inpaint_out.mp4"
     encode_frames(stitched_files, float(max(1, save_fps)), str(visual))
     return visual
@@ -255,6 +196,12 @@ def run_propainter(
         pause.wait_if_paused(cancel_event=None, on_progress=on_status)
     if cancel_event is not None and cancel_event.is_set():
         raise JobCancelled(None, "propainter")
+    def emit(message: str):
+        on_log(message)
+        if on_status:
+            on_status("inpaint", 0.34, message)
+
+    ensure_models(emit)
     if source.is_dir() and len(_list_images(source)) > subvideo_length:
         return _run_chunked(
             source,
@@ -269,7 +216,7 @@ def run_propainter(
             pause=pause,
             on_status=on_status,
         )
-    return _run_once(
+    _run_once(
         video_path,
         mask_path,
         output_dir,
@@ -280,3 +227,9 @@ def run_propainter(
         on_log=on_log,
         cancel_event=cancel_event,
     )
+    produced = _collect_chunk_frames(output)
+    if not produced:
+        raise RuntimeError("ProPainter 未产出修复帧")
+    visual = output / "inpaint_out.mp4"
+    encode_frames(produced, float(max(1, save_fps)), str(visual))
+    return visual

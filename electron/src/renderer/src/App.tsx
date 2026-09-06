@@ -10,6 +10,7 @@ type JobEvent = {
   outputPath?: string
   engine?: string
   partial?: boolean
+  cached?: boolean
 }
 
 const VIDEO_EXT = ['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v']
@@ -50,7 +51,7 @@ export default function App(): JSX.Element {
   const [resultUrl, setResultUrl] = useState<string | null>(null)
   const [regions, setRegions] = useState<Region[]>([])
   const [engine, setEngine] = useState<'auto' | 'propainter' | 'delogo'>('auto')
-  const [maxEdge, setMaxEdge] = useState(1280)
+  const [maxEdge, setMaxEdge] = useState(720)
   const [busy, setBusy] = useState(false)
   const [progress, setProgress] = useState(0)
   const [message, setMessage] = useState('等待视频')
@@ -63,6 +64,10 @@ export default function App(): JSX.Element {
   const [activeJobId, setActiveJobId] = useState<string | null>(null)
   const [paused, setPaused] = useState(false)
   const [jobStage, setJobStage] = useState('')
+  const [fromCache, setFromCache] = useState(false)
+  const [clearing, setClearing] = useState(false)
+  const [clearCurrent, setClearCurrent] = useState(0)
+  const [clearTotal, setClearTotal] = useState(0)
   const jobIdRef = useRef<string | null>(null)
   const pauseWantedRef = useRef(false)
 
@@ -182,6 +187,7 @@ export default function App(): JSX.Element {
     setError(null)
     setCompare(false)
     setPartial(false)
+    setFromCache(false)
     setProgress(0.04)
     setMessage('创建任务…')
     try {
@@ -225,12 +231,18 @@ export default function App(): JSX.Element {
             setResultPath(payload.outputPath)
             setUsedEngine(payload.engine ?? engine)
             setPartial(Boolean(payload.partial))
+            setFromCache(Boolean(payload.cached))
             setPaused(false)
             finish(() => resolve())
           }
           if (payload.stage === 'cancelled') {
             setProgress(0)
             setPaused(false)
+            setResultPath(null)
+            setResultUrl(null)
+            setCompare(false)
+            setPartial(false)
+            setJobStage('')
             finish(() => resolve())
           }
           if (payload.stage === 'error') {
@@ -269,15 +281,22 @@ export default function App(): JSX.Element {
     await fetch(`${apiBase}/jobs/${jobIdRef.current}/resume`, { method: 'POST' })
   }, [apiBase])
 
+  const cancelJob = useCallback(async () => {
+    if (!apiBase || !jobIdRef.current) return
+    pauseWantedRef.current = false
+    setMessage('正在取消任务…')
+    await fetch(`${apiBase}/jobs/${jobIdRef.current}/cancel`, { method: 'POST' })
+  }, [apiBase])
+
   useEffect(() => {
     if (!resultPath) return
     void window.api.toMediaUrl(resultPath).then((url) => {
       setResultUrl(url)
       setCompare(true)
       setProgress(1)
-      setMessage(partial ? '部分完成，可对比查看已处理片段' : '修复完成，可导出或对比查看')
+      setMessage(partial ? '部分完成，可对比查看已处理片段' : fromCache ? '命中缓存，已直接使用上次结果' : '修复完成，可导出或对比查看')
     })
-  }, [partial, resultPath])
+  }, [fromCache, partial, resultPath])
 
   const exportResult = useCallback(async () => {
     if (!resultPath || !inputPath) return
@@ -303,6 +322,59 @@ export default function App(): JSX.Element {
       setBusy(false)
     }
   }, [apiBase])
+
+  const clearJobsCache = useCallback(async () => {
+    if (!apiBase || clearing) return
+    const label = health?.cache?.label || '任务缓存'
+    const ok = window.confirm(
+      `删除全部任务缓存（当前约 ${label}）？抽帧和上次修复结果都会清掉，进行中的任务不受影响。`
+    )
+    if (!ok) return
+    setClearing(true)
+    setClearCurrent(0)
+    setClearTotal(health?.cache?.jobs || 1)
+    setMessage('正在清理缓存…')
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const response = await fetch(`${apiBase}/cache`)
+          if (!response.ok) return
+          const stats = (await response.json()) as {
+            clearing?: { current?: number; total?: number; message?: string }
+          }
+          const progress = stats.clearing
+          if (!progress) return
+          if (typeof progress.total === 'number' && progress.total > 0) setClearTotal(progress.total)
+          if (typeof progress.current === 'number') setClearCurrent(progress.current)
+          if (progress.message) setMessage(progress.message)
+        } catch {
+          /* ignore poll errors while deleting */
+        }
+      })()
+    }, 250)
+    try {
+      const response = await fetch(`${apiBase}/cache`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(await response.text())
+      const stats = (await response.json()) as { freedLabel?: string; label?: string }
+      setResultPath(null)
+      setResultUrl(null)
+      setCompare(false)
+      setPartial(false)
+      setFromCache(false)
+      setUsedEngine(null)
+      setClearCurrent(1)
+      setClearTotal(1)
+      setMessage(`已清理缓存，释放 ${stats.freedLabel || stats.label || label}`)
+      const healthRes = await fetch(`${apiBase}/health`)
+      if (healthRes.ok) setHealth((await healthRes.json()) as HealthInfo)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setMessage('清理缓存失败')
+    } finally {
+      window.clearInterval(timer)
+      setClearing(false)
+    }
+  }, [apiBase, clearing, health?.cache?.jobs, health?.cache?.label])
 
   const backendLabel = useMemo(() => {
     if (sidecar.status === 'ready') return '后端已连接'
@@ -390,14 +462,14 @@ export default function App(): JSX.Element {
               onChange={(event) => setMaxEdge(Number(event.target.value))}
               disabled={busy}
             >
-              <option value={720}>720（更省显存）</option>
-              <option value={1280}>1280（推荐）</option>
+              <option value={720}>720（推荐，更稳）</option>
+              <option value={1280}>1280（更清晰，更占显存）</option>
               <option value={1920}>1920</option>
               <option value={0}>原始分辨率</option>
             </select>
           </label>
 
-          <div className="rounded-xl border border-white/8 bg-black/20 p-3">
+          <div className="min-h-0 shrink rounded-xl border border-white/8 bg-black/20 p-3">
             <div className="mb-2 flex items-center justify-between text-xs text-zinc-500">
               <span>已框选 {regions.length} 块</span>
               <button
@@ -467,7 +539,7 @@ export default function App(): JSX.Element {
 
           {!health?.propainterReady ? (
             <button
-              className="rounded-lg border border-amber-300/30 px-3 py-2 text-sm text-amber-200 hover:bg-amber-300/10"
+              className="shrink-0 rounded-lg border border-amber-300/30 px-3 py-2 text-sm text-amber-200 hover:bg-amber-300/10"
               onClick={() => void installModel()}
               disabled={busy || !apiBase}
             >
@@ -475,15 +547,62 @@ export default function App(): JSX.Element {
             </button>
           ) : null}
 
+          <div className="mt-auto flex shrink-0 flex-col gap-2">
           <button
-            className={`mt-auto rounded-xl px-3 py-3 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 ${
-              busy && !paused ? 'bg-zinc-100 text-zinc-950' : 'bg-amber-300 text-zinc-950'
+            className={`relative flex h-10 w-full items-center justify-center overflow-hidden rounded-lg border border-white/12 px-3 text-sm hover:bg-white/8 disabled:cursor-not-allowed ${
+              clearing ? 'text-zinc-200 hover:bg-transparent' : 'text-zinc-300 disabled:opacity-40'
             }`}
-            disabled={busy ? !activeJobId : !canStart}
-            onClick={() => void (busy ? (paused ? resumeJob() : pauseJob()) : startJob())}
+            onClick={() => void clearJobsCache()}
+            disabled={!apiBase || clearing || !health?.cache?.bytes}
+            title="删除抽帧缓存、任务目录和上次修复结果"
           >
-            {busy ? (paused ? '继续' : '暂停') : '开始修复'}
+            {clearing ? (
+              <span
+                className="absolute inset-y-0 left-0 bg-amber-300/90 transition-[width] duration-200"
+                style={{ width: `${clearTotal > 0 ? Math.min(100, (clearCurrent / clearTotal) * 100) : 8}%` }}
+              />
+            ) : null}
+            <span
+              className={`relative z-10 truncate ${
+                clearing && clearTotal > 0 && clearCurrent / clearTotal > 0.35 ? 'text-zinc-950' : ''
+              }`}
+            >
+              {clearing
+                ? `清理中 · ${clearCurrent}/${clearTotal || '…'}  ${
+                    clearTotal > 0 ? `${Math.round((clearCurrent / clearTotal) * 100)}%` : ''
+                  }`
+                : `清理缓存${health?.cache?.bytes ? ` · ${health.cache.label}` : ''}`}
+            </span>
           </button>
+
+          {busy && paused ? (
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                className="rounded-xl bg-amber-300 px-3 py-3 text-sm font-medium text-zinc-950 disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={!activeJobId}
+                onClick={() => void resumeJob()}
+              >
+                继续
+              </button>
+              <button
+                className="rounded-xl border border-white/15 bg-white/8 px-3 py-3 text-sm font-medium text-zinc-200 hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={!activeJobId}
+                onClick={() => void cancelJob()}
+              >
+                取消
+              </button>
+            </div>
+          ) : (
+            <button
+              className={`rounded-xl px-3 py-3 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 ${
+                busy ? 'bg-zinc-100 text-zinc-950' : 'bg-amber-300 text-zinc-950'
+              }`}
+              disabled={busy ? !activeJobId : !canStart}
+              onClick={() => void (busy ? pauseJob() : startJob())}
+            >
+              {busy ? '暂停' : '开始修复'}
+            </button>
+          )}
 
           {resultPath ? (
             <div className="grid grid-cols-2 gap-2">
@@ -516,6 +635,7 @@ export default function App(): JSX.Element {
               </button>
             </div>
           ) : null}
+          </div>
         </aside>
       </main>
 

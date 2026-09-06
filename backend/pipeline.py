@@ -9,6 +9,7 @@ import numpy as np
 from PIL import Image
 
 from ffmpeg_util import find_ffmpeg, has_audio_stream, run_ffmpeg
+from job_cache import file_fingerprint, find_frames, materialize_frames, store_frames
 from propainter_runner import cuda_status, run_propainter
 from setup_propainter import propainter_ready
 from tracker import (
@@ -123,6 +124,21 @@ def choose_engine(engine: str) -> str:
     return "delogo"
 
 
+def _scale_regions(items: list[dict], sx: float, sy: float) -> list[dict]:
+    scaled = []
+    for item in items:
+        scaled.append(
+            {
+                **item,
+                "x": float(item["x"]) * sx,
+                "y": float(item["y"]) * sy,
+                "width": float(item["width"]) * sx,
+                "height": float(item["height"]) * sy,
+            }
+        )
+    return scaled
+
+
 def _normalize_regions(regions: list[dict] | None, rect: dict | None) -> list[dict]:
     items = list(regions or [])
     if not items and rect:
@@ -203,12 +219,32 @@ def run_job(
     items = _normalize_regions(regions, rect)
     used_engine = choose_engine(engine)
     output_path = str(work_dir / "output.mp4")
+    fingerprint = file_fingerprint(input_path)
+    cached_frames = find_frames(fingerprint, max_edge)
+    if cached_frames:
+        on_progress("extract", 0.28, "复用已抽出的帧")
+        frames = materialize_frames(cached_frames, work_dir / "frames")
+    else:
+        on_progress("extract", 0.06, "抽出视频帧" if max_edge <= 0 else f"抽出视频帧（最长边 {max_edge}）")
+        frames = extract_frames(
+            input_path,
+            work_dir / "frames",
+            cancel_event=cancel_event,
+            pause=pause,
+            on_status=on_progress,
+            max_edge=max_edge,
+        )
+        store_frames(work_dir / "frames", fingerprint, max_edge)
+    sample = cv2.imread(str(frames[0]))
+    if sample is None:
+        raise RuntimeError("无法读取抽出的帧")
+    work_h, work_w = sample.shape[:2]
+    sx = work_w / max(info["width"], 1)
+    sy = work_h / max(info["height"], 1)
+    if abs(sx - 1) > 0.001 or abs(sy - 1) > 0.001:
+        items = _scale_regions(items, sx, sy)
+        info = {**info, "width": work_w, "height": work_h}
     seeds = [clamp_oriented(item, info["width"], info["height"]) for item in items]
-
-    on_progress("extract", 0.06, "抽出视频帧")
-    frames = extract_frames(
-        input_path, work_dir / "frames", cancel_event=cancel_event, pause=pause, on_status=on_progress
-    )
     if track:
         region_boxes = _track_all(frames, items, info, on_progress, cancel_event, pause=pause)
     else:
@@ -236,17 +272,18 @@ def run_job(
             pause=pause,
             on_status=on_progress,
         )
-        partial = bool(cancel_event and cancel_event.is_set())
+        if cancel_event and cancel_event.is_set():
+            raise JobCancelled(None, used_engine)
         if not repaired:
             raise JobCancelled(None, used_engine)
         checkpoint(cancel_event, pause, on_progress)
         visual = str(work_dir / "visual.mp4")
         encode_frames(repaired, info["fps"], visual)
-        return _finish_visual(visual, input_path, output_path, info["fps"], on_progress, partial, used_engine)
+        return _finish_visual(visual, input_path, output_path, info["fps"], on_progress, False, used_engine)
 
     ratio = compute_resize_ratio(info["width"], info["height"], max_edge)
     checkpoint(cancel_event, pause, on_progress)
-    on_progress("inpaint", 0.34, "ProPainter 修复中")
+    on_progress("inpaint", 0.34, "正在加载 ProPainter 模型…")
     pp_out_dir = str(work_dir / "propainter")
     Path(pp_out_dir).mkdir(parents=True, exist_ok=True)
     last_error = None
@@ -259,7 +296,7 @@ def run_job(
                 if line.startswith("PROPAINTER_PCT "):
                     pct = int(line.split()[1]) / 100
                     on_progress("inpaint", 0.35 + pct * 0.5, f"ProPainter 修复中 {int(pct * 100)}%")
-                elif "Processing:" in line or "saved in" in line:
+                else:
                     on_progress("inpaint", None, line[:180])
 
             visual = run_propainter(

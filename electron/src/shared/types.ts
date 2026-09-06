@@ -17,6 +17,20 @@ export type HealthInfo = {
     version: string | null
   }
   python: string
+  cache?: {
+    bytes: number
+    label: string
+    jobs: number
+    frames: number
+    results: number
+    clearing?: {
+      active: boolean
+      current: number
+      total: number
+      name: string
+      message: string
+    }
+  }
 }
 
 export type Rect = {

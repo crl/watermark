@@ -12,6 +12,7 @@ from ffmpeg_util import run_ffmpeg
 SCORE_KEEP = 0.48
 MASK_PAD = 12
 MAX_PEAKS = 4
+TRACK_STRIDE = 3
 
 Oriented = tuple[int, int, int, int, float]
 
@@ -70,11 +71,22 @@ def extract_frames(
     cancel_event: Event | None = None,
     pause: PauseController | None = None,
     on_status=None,
+    max_edge: int = 0,
 ) -> list[Path]:
     checkpoint(cancel_event, pause, on_status)
     out_dir.mkdir(parents=True, exist_ok=True)
     pattern = str(out_dir / "%06d.jpg")
-    result = run_ffmpeg(["-y", "-i", video_path, "-q:v", "2", pattern])
+    scale_args: list[str] = []
+    if max_edge > 0:
+        scale_args = [
+            "-vf",
+            (
+                f"scale='if(gte(iw,ih),min(iw,{max_edge}),-2)':"
+                f"'if(gt(ih,iw),min(ih,{max_edge}),-2)',"
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+            ),
+        ]
+    result = run_ffmpeg(["-y", "-i", video_path, *scale_args, "-q:v", "3", pattern])
     checkpoint(cancel_event, pause, on_status)
     files = sorted(out_dir.glob("*.jpg"))
     if files:
@@ -88,8 +100,18 @@ def extract_frames(
         ok, frame = cap.read()
         if not ok:
             break
+        if max_edge > 0:
+            height, width = frame.shape[:2]
+            longest = max(width, height)
+            if longest > max_edge:
+                scale = max_edge / longest
+                frame = cv2.resize(
+                    frame,
+                    (max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2)),
+                    interpolation=cv2.INTER_AREA,
+                )
         path = out_dir / f"{index:06d}.jpg"
-        cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         index += 1
     cap.release()
     files = sorted(out_dir.glob("*.jpg"))
@@ -211,6 +233,8 @@ def track_region(
         checkpoint(cancel_event, pause, on_status)
         if idx == start_index:
             continue
+        if idx != n - 1 and abs(idx - start_index) % TRACK_STRIDE != 0:
+            continue
         bgr = cv2.imread(str(frame_path))
         if bgr is None:
             continue
@@ -219,6 +243,12 @@ def track_region(
         if on_progress and idx % 6 == 0:
             on_progress(idx, n)
     boxes[start_index] = [seed]
+    last = boxes[start_index]
+    for idx in range(n):
+        if boxes[idx]:
+            last = boxes[idx]
+        else:
+            boxes[idx] = last
     others = match_peaks(_gray(start_bgr), template)
     for item in others:
         if _iou(item, aabb) < 0.35:

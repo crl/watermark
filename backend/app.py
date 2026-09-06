@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import socket
 import sys
 import traceback
@@ -16,13 +17,22 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ffmpeg_util import find_ffmpeg
-from pipeline import probe_video, run_job
+from job_cache import (
+    JOBS_DIR,
+    cache_stats,
+    clear_cache,
+    file_fingerprint,
+    find_result,
+    prune_work_dir,
+    result_key,
+    store_result,
+)
+from pipeline import choose_engine, probe_video, run_job
 from propainter_runner import cuda_status
 from setup_propainter import ensure_propainter, propainter_ready
 from tracker import JobCancelled, PauseController
 
 ROOT = Path(__file__).resolve().parent
-JOBS_DIR = ROOT / ".jobs"
 
 app = FastAPI(title="WaterMark Sidecar")
 app.add_middleware(
@@ -33,6 +43,13 @@ app.add_middleware(
 )
 
 jobs: dict[str, dict[str, Any]] = {}
+_clear_progress: dict[str, Any] = {
+    "active": False,
+    "current": 0,
+    "total": 0,
+    "name": "",
+    "message": "",
+}
 
 
 class Rect(BaseModel):
@@ -49,7 +66,7 @@ class CreateJob(BaseModel):
     rect: Rect | None = None
     regions: list[Rect] = Field(default_factory=list)
     engine: str = Field(default="auto")
-    maxEdge: int = Field(default=1280)
+    maxEdge: int = Field(default=720)
     track: bool = True
 
 
@@ -65,6 +82,7 @@ def health():
         "cuda": cuda,
         "python": sys.executable,
         "jobsDir": str(JOBS_DIR),
+        "cache": {**cache_stats(), "clearing": dict(_clear_progress)},
     }
 
 
@@ -116,6 +134,51 @@ async def create_job(body: CreateJob):
             )
 
         try:
+            fingerprint = file_fingerprint(input_path)
+            regions_payload = [item.model_dump() for item in body.regions]
+            rect_payload = body.rect.model_dump() if body.rect else None
+            if body.engine == "auto":
+                status = cuda_status()
+                lookup_engine = "propainter" if propainter_ready() and status.get("torch") else "delogo"
+            else:
+                lookup_engine = body.engine
+            cache_id = result_key(
+                fingerprint,
+                body.maxEdge,
+                lookup_engine,
+                body.track,
+                regions_payload,
+                rect_payload,
+            )
+            cached = find_result(cache_id)
+            if cached:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                job["status"] = "done"
+                job["outputPath"] = cached["outputPath"]
+                job["engine"] = cached.get("engine") or lookup_engine
+                await queue.put(
+                    {
+                        "stage": "done",
+                        "progress": 1,
+                        "message": "命中缓存，已直接使用上次结果",
+                        "outputPath": cached["outputPath"],
+                        "engine": job["engine"],
+                        "partial": False,
+                        "cached": True,
+                    }
+                )
+                return
+
+            used_engine = choose_engine(body.engine)
+            cache_id = result_key(
+                fingerprint,
+                body.maxEdge,
+                used_engine,
+                body.track,
+                regions_payload,
+                rect_payload,
+            )
+
             output, engine, partial = await asyncio.to_thread(
                 run_job,
                 input_path=str(input_path),
@@ -132,6 +195,9 @@ async def create_job(body: CreateJob):
             job["status"] = "done"
             job["outputPath"] = output
             job["engine"] = engine
+            if not partial:
+                store_result(output, cache_id, engine)
+            prune_work_dir(work_dir)
             await queue.put(
                 {
                     "stage": "done",
@@ -142,32 +208,49 @@ async def create_job(body: CreateJob):
                     "partial": partial,
                 }
             )
-        except JobCancelled as exc:
-            if exc.output_path:
-                job["status"] = "done"
-                job["outputPath"] = exc.output_path
-                await queue.put(
-                    {
-                        "stage": "done",
-                        "progress": 1,
-                        "message": "部分完成，可查看已处理片段",
-                        "outputPath": exc.output_path,
-                        "engine": exc.engine,
-                        "partial": True,
-                    }
-                )
-            else:
-                job["status"] = "cancelled"
-                await queue.put({"stage": "cancelled", "progress": 0, "message": "已取消，尚未开始修复"})
+        except JobCancelled:
+            job["status"] = "cancelled"
+            shutil.rmtree(work_dir, ignore_errors=True)
+            await queue.put({"stage": "cancelled", "progress": 0, "message": "已取消任务"})
         except Exception as exc:
             job["status"] = "error"
             job["error"] = str(exc)
+            shutil.rmtree(work_dir, ignore_errors=True)
             await queue.put({"stage": "error", "message": str(exc), "detail": traceback.format_exc()})
         finally:
             await queue.put(None)
 
     asyncio.create_task(runner())
     return {"jobId": job_id}
+
+
+@app.get("/cache")
+def get_cache():
+    return {**cache_stats(), "clearing": dict(_clear_progress)}
+
+
+@app.delete("/cache")
+async def delete_cache():
+    if _clear_progress.get("active"):
+        raise HTTPException(409, "正在清理缓存")
+    keep = {job_id for job_id, job in jobs.items() if job.get("status") in {"running", "pausing"}}
+    _clear_progress.update({"active": True, "current": 0, "total": 0, "name": "", "message": "开始清理"})
+
+    def report(current: int, total: int, name: str) -> None:
+        _clear_progress.update(
+            {
+                "active": True,
+                "current": current,
+                "total": total,
+                "name": name,
+                "message": f"正在删除 {name}" if name and name != "完成" else "清理完成",
+            }
+        )
+
+    try:
+        return await asyncio.to_thread(clear_cache, keep, report)
+    finally:
+        _clear_progress.update({"active": False, "message": "清理完成"})
 
 
 @app.post("/jobs/{job_id}/pause")
